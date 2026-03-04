@@ -8,6 +8,7 @@ Create an **n8n workflow** that receives an **Incident** payload, normalizes/val
 
 This exercise is **fully offline** — do **not** call real Slack or Microsoft endpoints.
 
+Make sure you fork this repo and submit your response in the forked repo
 ---
 
 ## What’s included in this repo
@@ -139,7 +140,7 @@ You can confirm the mocks are reachable with:
 npm run demo -- fixtures/incidents/INC-10001.json
 ```
 
-What to submit
+# What to submit back
 
 Place your deliverables under `submission/`:
 
