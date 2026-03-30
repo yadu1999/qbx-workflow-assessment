@@ -1,0 +1,159 @@
+{
+  "name": "Incident Notifier Workflow",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "incident",
+        "httpMethod": "POST",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "node-1",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [100, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract body and validate fields\nconst input = $input.first().json;\nconst data = input.body || input;\n\nconst required = ['incidentId', 'severity', 'title', 'createdAt'];\nfor (const field of required) {\n  if (!data[field]) {\n    throw new Error(`Missing required field: ${field}`);\n  }\n}\n\n// Map severity to number (P1=1, P2=2, etc)\nconst severityMap = { P1: 1, P2: 2, P3: 3, P4: 4 };\nconst sev = data.severity.toUpperCase();\nif (!severityMap[sev]) {\n  throw new Error(`Invalid severity value: ${data.severity}`);\n}\nconst severityCode = severityMap[sev];\n\n// Generate a unique key for deduplication\n// Using a simple hash to keep it lightweight\nfunction getHash(str) {\n  let h = 5381;\n  for (let i = 0; i < str.length; i++) {\n    h = (h * 33) ^ str.charCodeAt(i);\n  }\n  return (h >>> 0).toString(16);\n}\nconst keyBase = `${data.incidentId}:${sev}:${data.createdAt}`;\nconst dedupeKey = `${data.incidentId}-${getHash(keyBase)}`;\n\n// Clean up description and messages\nconst desc = (data.description || '').trim();\nconst cleanDesc = desc.length > 240 ? desc.substring(0, 237) + '...' : desc;\n\nreturn [{\n  json: {\n    ...data,\n    severity: sev,\n    severityRank: severityCode,\n    description: cleanDesc,\n    dedupeKey,\n    // Prepared messages\n    slackMsg: `[${sev} - Rank ${severityCode}] *${data.title}* (${data.incidentId})\\n${cleanDesc ? cleanDesc + '\\n' : ''}Store: ${data.storeId || 'N/A'}`,\n    emailSub: `[${sev}] Incident: ${data.title} (${data.incidentId})`,\n    emailBody: `Incident ID: ${data.incidentId}\\nSeverity: ${sev} (${severityCode})\\nTitle: ${data.title}\\nCreated: ${data.createdAt}\\n\\nDescription:\\n${cleanDesc || 'No description provided.'}`\n  }\n}];\n"
+      },
+      "id": "node-2",
+      "name": "Process Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [320, 300],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ error: $json.message }) }}",
+        "options": {
+          "responseCode": 400
+        }
+      },
+      "id": "node-3",
+      "name": "Error 400",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [540, 500]
+    },
+    {
+      "parameters": {
+        "jsCode": "const fs = require('fs');\nconst path = require('path');\n\nconst item = $input.first().json;\nconst key = item.dedupeKey;\n\n// Persistent store file\nconst filePath = path.join(process.cwd(), 'processed_incidents.json');\n\nlet cache = [];\nif (fs.existsSync(filePath)) {\n  try {\n    cache = JSON.parse(fs.readFileSync(filePath, 'utf8'));\n  } catch (e) { cache = []; }\n}\n\nif (cache.includes(key)) {\n  return [[], [{ json: { duplicate: true, key, id: item.incidentId } }]];\n}\n\n// Save and continue\ncache.push(key);\nif (cache.length > 1000) cache.shift(); // Keep it around 1k entries\nfs.writeFileSync(filePath, JSON.stringify(cache), 'utf8');\n\nreturn [[{ json: item }], []];\n"
+      },
+      "id": "node-4",
+      "name": "Check Duplicate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [540, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"status\": \"ignored\", \"reason\": \"duplicate\" }",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "node-5",
+      "name": "Ignore Duplicate",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [760, 460]
+    },
+    {
+      "parameters": {
+        "url": "http://localhost:4010/chat.postMessage",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "Bearer slack-test-token" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"channel\": \"#oncall-alerts\",\n  \"text\": {{ JSON.stringify($json.slackMsg) }}\n}",
+        "options": {}
+      },
+      "id": "node-6",
+      "name": "Slack",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [780, 180],
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "url": "http://localhost:4020/me/sendMail",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "Bearer ms-test-token" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"message\": {\n    \"subject\": {{ JSON.stringify($json.emailSub) }},\n    \"body\": { \"contentType\": \"Text\", \"content\": {{ JSON.stringify($json.emailBody) }} },\n    \"toRecipients\": [ { \"emailAddress\": { \"address\": {{ JSON.stringify($json.ownerEmail || 'admin@example.com') }} } } ]\n  }\n}",
+        "options": {}
+      },
+      "id": "node-7",
+      "name": "Email",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [780, 360],
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"status\": \"ok\", \"id\": \"{{ $json.incidentId }}\" }",
+        "options": {
+          "responseCode": 202
+        }
+      },
+      "id": "node-8",
+      "name": "Success 202",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1020, 240]
+    },
+    {
+      "parameters": {
+        "jsCode": "const fs = require('fs');\nconst path = require('path');\nconst data = $input.first().json;\n\nconst logPath = path.join(process.cwd(), 'failures.log');\nconst entry = `[${new Date().toISOString()}] Slack Failed for ${data.incidentId || '?'}: ${data.error || 'Unknown error'}\\n`;\n\nfs.appendFileSync(logPath, entry);\nreturn [{ json: { logged: true } }];"
+      },
+      "id": "node-9",
+      "name": "Log Slack Err",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1020, 100]
+    },
+    {
+      "parameters": {
+        "jsCode": "const fs = require('fs');\nconst path = require('path');\nconst data = $input.first().json;\n\nconst logPath = path.join(process.cwd(), 'failures.log');\nconst entry = `[${new Date().toISOString()}] Email Failed for ${data.incidentId || '?'}: ${data.error || 'Unknown error'}\\n`;\n\nfs.appendFileSync(logPath, entry);\nreturn [{ json: { logged: true } }];"
+      },
+      "id": "node-10",
+      "name": "Log Email Err",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1020, 380]
+    }
+  ],
+  "connections": {
+    "Webhook": { "main": [[{ "node": "Process Data", "type": "main", "index": 0 }]] },
+    "Process Data": { "main": [[{ "node": "Check Duplicate", "type": "main", "index": 0 }], [{ "node": "Error 400", "type": "main", "index": 1 }]] },
+    "Check Duplicate": { "main": [[{ "node": "Slack", "type": "main", "index": 0 }, { "node": "Email", "type": "main", "index": 0 }], [{ "node": "Ignore Duplicate", "type": "main", "index": 0 }]] },
+    "Slack": { "main": [[{ "node": "Success 202", "type": "main", "index": 0 }], [{ "node": "Log Slack Err", "type": "main", "index": 0 }]] },
+    "Email": { "main": [[], [{ "node": "Log Email Err", "type": "main", "index": 0 }]] }
+  }
+  
+}
